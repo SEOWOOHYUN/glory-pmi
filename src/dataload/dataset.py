@@ -224,13 +224,15 @@ class ValidGraphDataset(TrainGraphDataset):
 
         batch = Batch.from_data_list([sub_news_graph])
 
-        return batch, mapping_idx, clicked_entity, candidate_input, candidate_entity, entity_mask, labels
+        metadata = {'impression_id': line[0], 'user_id': line[1],
+                    'candidates': [token.rsplit('-', 1)[0] for token in line[4].split()]}
+        return batch, mapping_idx, clicked_entity, candidate_input, candidate_entity, entity_mask, labels, metadata
     
     def __iter__(self):
-        for line in open(self.filename):
-            if line.strip().split('\t')[3]:
-                batch, mapping_idx, clicked_entity, candidate_input, candidate_entity, entity_mask, labels = self.line_mapper(line)
-            yield batch, mapping_idx, clicked_entity, candidate_input, candidate_entity, entity_mask, labels
+        with open(self.filename) as stream:
+            for line in stream:
+                if line.rstrip('\r\n').split('\t')[3].strip():
+                    yield self.line_mapper(line)
 
 
 class NewsDataset(Dataset):

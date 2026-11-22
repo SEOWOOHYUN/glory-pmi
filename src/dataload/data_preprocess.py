@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import json
 import itertools
+from dataload.neighbor_scoring import neighbor_cache_name, rank_incoming
 
 
 def update_dict(target_dict, key, value=None):
@@ -42,7 +43,7 @@ def get_sample(all_elements, num_sample):
 def prepare_distributed_data(cfg, mode="train"):
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
     # check
-    target_file = os.path.join(data_dir[mode], f"behaviors_np{cfg.npratio}_0.tsv")
+    target_file = os.path.join(data_dir[mode], f"behaviors_np{cfg.npratio}_seed{cfg.seed}_0.tsv")
     if os.path.exists(target_file) and not cfg.reprocess:
         return 0
     print(f'Target_file is not exist. New behavior file in {target_file}')
@@ -83,7 +84,7 @@ def prepare_distributed_data(cfg, mode="train"):
 
     print(f'[{mode}]Writing files...')
     for i in range(cfg.gpu_num):
-        processed_file_path = os.path.join(data_dir[mode], f'behaviors_np{cfg.npratio}_{i}.tsv')
+        processed_file_path = os.path.join(data_dir[mode], f'behaviors_np{cfg.npratio}_seed{cfg.seed}_{i}.tsv')
         with open(processed_file_path, 'w') as f:
             f.writelines(behaviors_per_file[i])
 
@@ -106,6 +107,7 @@ def read_raw_news(cfg, file_path, mode='train'):
     """
     import nltk
     nltk.download('punkt')
+    nltk.download('punkt_tab')
     
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
 
@@ -280,7 +282,7 @@ def prepare_news_graph(cfg, mode='train'):
         edge_weights = Counter(short_edges)
         unique_edges = list(edge_weights.keys())
 
-        edge_index = torch.tensor(list(zip(*unique_edges)), dtype=torch.long)
+        edge_index = torch.tensor(unique_edges, dtype=torch.long).reshape(-1, 2).t().contiguous()
         edge_attr = torch.tensor([edge_weights[edge] for edge in unique_edges], dtype=torch.long)
 
         data = Data(x=torch.from_numpy(node_feat),
@@ -292,7 +294,7 @@ def prepare_news_graph(cfg, mode='train'):
         print(f"[{mode}] Finish News Graph Construction, \nGraph Path: {target_path} \nGraph Info: {data}")
     
     elif mode in ['test', 'val']:
-        origin_graph = torch.load(origin_graph_path)
+        origin_graph = torch.load(origin_graph_path, weights_only=False)
         edge_index = origin_graph.edge_index
         edge_attr = origin_graph.edge_attr
         node_feat = nltk_token_news
@@ -311,6 +313,17 @@ def prepare_neighbor_list(cfg, mode='train', target='news'):
 
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
 
+    if target == 'news':
+        if not cfg.model.directed or cfg.model.use_graph_type != 0:
+            raise ValueError('PMI experiment requires a directed sequential graph')
+        # Rebuild from counts: switching methods must never reuse another ranking.
+        graph = torch.load(Path(data_dir[mode]) / 'nltk_news_graph.pt', weights_only=False)
+        counts = dict(zip(map(tuple, graph.edge_index.t().tolist()), graph.edge_attr.tolist()))
+        neighbors = rank_incoming(counts, cfg.neighbor_method, cfg.pmi_lambda)
+        with open(Path(data_dir[mode]) / neighbor_cache_name(cfg), 'wb') as stream:
+            pickle.dump(neighbors, stream)
+        return
+
     neighbor_dict_path = Path(data_dir[mode]) / f"{target}_neighbor_dict.bin"
     weights_dict_path = Path(data_dir[mode]) / f"{target}_weights_dict.bin"
 
@@ -326,11 +339,11 @@ def prepare_neighbor_list(cfg, mode='train', target='news'):
     if target == 'news':
         target_graph_path = Path(data_dir[mode]) / "nltk_news_graph.pt"
         target_dict = pickle.load(open(Path(data_dir[mode]) / "news_dict.bin", "rb"))
-        graph_data = torch.load(target_graph_path)
+        graph_data = torch.load(target_graph_path, weights_only=False)
     elif target == 'entity':
         target_graph_path = Path(data_dir[mode]) / "entity_graph.pt"
         target_dict = pickle.load(open(Path(data_dir[mode]) / "entity_dict.bin", "rb"))
-        graph_data = torch.load(target_graph_path)
+        graph_data = torch.load(target_graph_path, weights_only=False)
     else:
         assert False, f"[{mode}] Wrong target {target} "
 
@@ -373,7 +386,7 @@ def prepare_entity_graph(cfg, mode='train'):
 
     if mode == 'train':
         target_news_graph_path = Path(data_dir[mode]) / "nltk_news_graph.pt"
-        news_graph = torch.load(target_news_graph_path)
+        news_graph = torch.load(target_news_graph_path, weights_only=False)
         print("news_graph,", news_graph)
         entity_indices = news_graph.x[:, -8:-3].numpy()
         print("entity_indices, ", entity_indices.shape)
@@ -400,7 +413,7 @@ def prepare_entity_graph(cfg, mode='train'):
         edge_weights = Counter(entity_edge_index)
         unique_edges = list(edge_weights.keys())
 
-        edge_index = torch.tensor(list(zip(*unique_edges)), dtype=torch.long)
+        edge_index = torch.tensor(unique_edges, dtype=torch.long).reshape(-1, 2).t().contiguous()
         edge_attr = torch.tensor([edge_weights[edge] for edge in unique_edges], dtype=torch.long)
 
         # --- Entity Graph Undirected
@@ -414,7 +427,7 @@ def prepare_entity_graph(cfg, mode='train'):
         torch.save(data, target_path)
         print(f"[{mode}] Finish Entity Graph Construction, \n Graph Path: {target_path} \nGraph Info: {data}")
     elif mode in ['val', 'test']:
-        origin_graph = torch.load(origin_graph_path)
+        origin_graph = torch.load(origin_graph_path, weights_only=False)
         edge_index = origin_graph.edge_index
         edge_attr = origin_graph.edge_attr
 
@@ -429,6 +442,7 @@ def prepare_entity_graph(cfg, mode='train'):
 def prepare_preprocessed_data(cfg):
     prepare_distributed_data(cfg, "train")
     prepare_distributed_data(cfg, "val")
+    prepare_distributed_data(cfg, "test")
 
     prepare_preprocess_bin(cfg, "train")
     prepare_preprocess_bin(cfg, "val")
@@ -441,6 +455,9 @@ def prepare_preprocessed_data(cfg):
     prepare_neighbor_list(cfg, 'train', 'news')
     prepare_neighbor_list(cfg, 'val', 'news')
     prepare_neighbor_list(cfg, 'test', 'news')
+
+    if not cfg.model.use_entity:
+        return
 
     prepare_entity_graph(cfg, 'train')
     prepare_entity_graph(cfg, 'val')
@@ -459,6 +476,10 @@ def prepare_preprocessed_data(cfg):
     val_combined_path = Path(data_dir['val']) / "combined_entity_embedding.vec"
     test_combined_path = Path(data_dir['test']) / "combined_entity_embedding.vec"
 
-    os.system("cat " + f"{train_entity_emb_path} {val_entity_emb_path}" + f" > {val_combined_path}")
-    os.system("cat " + f"{train_entity_emb_path} {test_entity_emb_path}" + f" > {test_combined_path}")
-
+    import shutil
+    for source, destination in ((val_entity_emb_path, val_combined_path),
+                                (test_entity_emb_path, test_combined_path)):
+        with destination.open('wb') as out:
+            for path in (train_entity_emb_path, source):
+                with path.open('rb') as incoming:
+                    shutil.copyfileobj(incoming, out)

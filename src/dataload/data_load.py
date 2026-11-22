@@ -9,6 +9,7 @@ from tqdm import tqdm
 import pickle
 
 from dataload.dataset import *
+from dataload.neighbor_scoring import neighbor_cache_name
 
 def load_data(cfg, mode='train', model=None, local_rank=0):
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
@@ -19,16 +20,16 @@ def load_data(cfg, mode='train', model=None, local_rank=0):
     news_input = pickle.load(open(Path(data_dir[mode]) / "nltk_token_news.bin", "rb"))
     # ------------- load behaviors_np{X}.tsv --------------
     if mode == 'train':
-        target_file = Path(data_dir[mode]) / f"behaviors_np{cfg.npratio}_{local_rank}.tsv"
+        target_file = Path(data_dir[mode]) / f"behaviors_np{cfg.npratio}_seed{cfg.seed}_{local_rank}.tsv"
         if cfg.model.use_graph:
-            news_graph = torch.load(Path(data_dir[mode]) / "nltk_news_graph.pt")
+            news_graph = torch.load(Path(data_dir[mode]) / "nltk_news_graph.pt", weights_only=False)
 
             if cfg.model.directed is False:
                 news_graph.edge_index, news_graph.edge_attr = to_undirected(news_graph.edge_index, news_graph.edge_attr)
             print(f"[{mode}] News Graph Info: {news_graph}")
 
 
-            news_neighbors_dict = pickle.load(open(Path(data_dir[mode]) / "news_neighbor_dict.bin", "rb"))
+            news_neighbors_dict = pickle.load(open(Path(data_dir[mode]) / neighbor_cache_name(cfg), "rb"))
 
             if cfg.model.use_entity:
                 entity_neighbors = pickle.load(open(Path(data_dir[mode]) / "entity_neighbor_dict.bin", "rb"))
@@ -80,25 +81,25 @@ def load_data(cfg, mode='train', model=None, local_rank=0):
         news_emb = torch.cat(stacked_news, dim=0).cpu().numpy()   
 
         if cfg.model.use_graph:
-            news_graph = torch.load(Path(data_dir[mode]) / "nltk_news_graph.pt")
+            news_graph = torch.load(Path(data_dir[mode]) / "nltk_news_graph.pt", weights_only=False)
 
-            news_neighbors_dict = pickle.load(open(Path(data_dir[mode]) / "news_neighbor_dict.bin", "rb"))
+            news_neighbors_dict = pickle.load(open(Path(data_dir[mode]) / neighbor_cache_name(cfg), "rb"))
 
             if cfg.model.directed is False:
                 news_graph.edge_index, news_graph.edge_attr = to_undirected(news_graph.edge_index, news_graph.edge_attr)
             print(f"[{mode}] News Graph Info: {news_graph}")
 
             if cfg.model.use_entity:
-                # entity_graph = torch.load(Path(data_dir[mode]) / "entity_graph.pt")
+                # entity_graph = torch.load(Path(data_dir[mode]) / "entity_graph.pt", weights_only=False)
                 entity_neighbors = pickle.load(open(Path(data_dir[mode]) / "entity_neighbor_dict.bin", "rb"))
                 total_length = sum(len(lst) for lst in entity_neighbors.values())
                 print(f"[{mode}] entity_neighbor list Length: {total_length}")
             else:
                 entity_neighbors = None
 
-            if mode == 'val':
+            if mode in ('val', 'test'):
                 dataset = ValidGraphDataset(
-                    filename=Path(data_dir[mode]) / f"behaviors_np{cfg.npratio}_{local_rank}.tsv",
+                    filename=Path(data_dir[mode]) / f"behaviors_np{cfg.npratio}_seed{cfg.seed}_{local_rank}.tsv",
                     news_index=news_index,
                     news_input=news_emb,
                     local_rank=local_rank,

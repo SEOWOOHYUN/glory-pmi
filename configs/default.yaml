@@ -6,7 +6,7 @@ defaults:
   - path: default
   - model: GLORY
   - logger: wandb
-  - dataset: MINDlarge
+  - dataset: MINDLarge
   - _self_
 
 seed: 3407 # 3407 is all you need
@@ -31,3 +31,12 @@ val_steps: 1000
 ml_label: default
 gpu_num: 1
 reprocess: false
+neighbor_method: count
+pmi_lambda: 5.0
+eval_only: false
+eval_split: val
+checkpoint_path: null
+result_dir: null
+max_steps: null
+export_predictions: false
+data_fingerprint: null

@@ -1,4 +1,7 @@
 import os.path
+import math
+import shutil
+from itertools import islice
 from pathlib import Path
 
 import hydra
@@ -16,10 +19,11 @@ from dataload.data_load import load_data
 from dataload.data_preprocess import prepare_preprocessed_data
 from utils.metrics import *
 from utils.common import *
+from utils.evaluation import evaluate
 
 ### custom your wandb setting here ###
 # os.environ["WANDB_API_KEY"] = ""
-os.environ["WANDB_MODE"] = "offline"
+os.environ.setdefault("WANDB_MODE", "offline")
 
 def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, early_stopping):
     model.train()
@@ -28,9 +32,10 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
     sum_loss = torch.zeros(1).to(local_rank)
     sum_auc = torch.zeros(1).to(local_rank)
 
+    max_steps = cfg.max_steps or math.ceil(cfg.num_epochs * math.ceil(cfg.dataset.pos_count / cfg.batch_size))
     for cnt, (subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask, labels) \
-            in enumerate(tqdm(dataloader,
-                              total=int(cfg.num_epochs * (cfg.dataset.pos_count // cfg.batch_size + 1)),
+            in enumerate(tqdm(islice(dataloader, max_steps),
+                              total=max_steps,
                               desc=f"[{local_rank}] Training"), start=1):
         subgraph = subgraph.to(local_rank, non_blocking=True)
         mapping_idx = mapping_idx.to(local_rank, non_blocking=True)
@@ -44,7 +49,7 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
             
         # Accumulate the gradients
         scaler.scale(bz_loss).backward()
-        if cnt % cfg.accumulation_steps == 0 or cnt == int(cfg.dataset.pos_count / cfg.batch_size):
+        if cnt % cfg.accumulation_steps == 0 or cnt == max_steps:
             # Update the parameters
             scaler.step(optimizer)
             old_scaler = scaler.get_scale()
@@ -66,7 +71,7 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
             sum_loss.zero_()
             sum_auc.zero_()
         
-        if cnt > int(cfg.val_skip_epochs * (cfg.dataset.pos_count // cfg.batch_size + 1)) and  cnt % cfg.val_steps == 0:
+        if cnt == max_steps or (cnt > cfg.val_skip_epochs * math.ceil(cfg.dataset.pos_count / cfg.batch_size) and cnt % cfg.val_steps == 0):
             res = val(model, local_rank, cfg)
             model.train()
 
@@ -74,6 +79,8 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
                 pretty_print(res)
                 wandb.log(res)
 
+            if res['auc'] is None:
+                raise ValueError('Validation has no defined AUC')
             early_stop, get_better = early_stopping(res['auc'])
             if early_stop:
                 print("Early Stop.")
@@ -81,50 +88,18 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
             elif get_better:
                 print(f"Better Result!")
                 if local_rank == 0:
-                    save_model(cfg, model, optimizer, f"{cfg.ml_label}_auc{res['auc']}")
+                    save_model(cfg, model, optimizer, "best")
+                    output = Path(cfg.result_dir or cfg.path.pred_dir)
+                    for suffix in ('json', 'jsonl'):
+                        shutil.copyfile(output / f'val-latest.{suffix}', output / f'val-best.{suffix}')
+                    (output / 'best_step.txt').write_text(str(cnt) + '\n')
                     wandb.run.summary.update({"best_auc": res["auc"],"best_mrr":res['mrr'], 
                                          "best_ndcg5":res['ndcg5'], "best_ndcg10":res['ndcg10']})
 
 
 
 def val(model, local_rank, cfg):
-    model.eval()
-    dataloader = load_data(cfg, mode='val', model=model, local_rank=local_rank)
-    tasks = []
-    with torch.no_grad():
-        for cnt, (subgraph, mappings, clicked_entity, candidate_input, candidate_entity, entity_mask, labels) \
-                in enumerate(tqdm(dataloader,
-                                  total=int(cfg.dataset.val_len / cfg.gpu_num ),
-                                  desc=f"[{local_rank}] Validating")):
-            candidate_emb = torch.FloatTensor(np.array(candidate_input)).to(local_rank, non_blocking=True)
-            candidate_entity = candidate_entity.to(local_rank, non_blocking=True)
-            entity_mask = entity_mask.to(local_rank, non_blocking=True)
-            clicked_entity = clicked_entity.to(local_rank, non_blocking=True)
-
-            scores = model.module.validation_process(subgraph, mappings, clicked_entity, candidate_emb, candidate_entity, entity_mask)
-            
-            tasks.append((labels.tolist(), scores))
-
-    with mp.Pool(processes=cfg.num_workers) as pool:
-        results = pool.map(cal_metric, tasks)
-    val_auc, val_mrr, val_ndcg5, val_ndcg10 = np.array(results).T
-
-    # barrier
-    torch.distributed.barrier()
-
-    reduced_auc = reduce_mean(torch.tensor(np.nanmean(val_auc)).float().to(local_rank), cfg.gpu_num)
-    reduced_mrr = reduce_mean(torch.tensor(np.nanmean(val_mrr)).float().to(local_rank), cfg.gpu_num)
-    reduced_ndcg5 = reduce_mean(torch.tensor(np.nanmean(val_ndcg5)).float().to(local_rank), cfg.gpu_num)
-    reduced_ndcg10 = reduce_mean(torch.tensor(np.nanmean(val_ndcg10)).float().to(local_rank), cfg.gpu_num)
-
-    res = {
-        "auc": reduced_auc.item(),
-        "mrr": reduced_mrr.item(),
-        "ndcg5": reduced_ndcg5.item(),
-        "ndcg10": reduced_ndcg10.item(),
-    }
-    
-    return res
+    return evaluate(model, local_rank, cfg, 'val')
 
 
 def main_worker(local_rank, cfg):
@@ -136,7 +111,7 @@ def main_worker(local_rank, cfg):
                             rank=local_rank)
 
     # -----------------------------------------Dataset & Model Load
-    num_training_steps = int(cfg.num_epochs * cfg.dataset.pos_count / (cfg.batch_size * cfg.accumulation_steps))
+    num_training_steps = math.ceil((cfg.max_steps or (cfg.num_epochs * math.ceil(cfg.dataset.pos_count / cfg.batch_size))) / cfg.accumulation_steps)
     num_warmup_steps = int(num_training_steps * cfg.warmup_ratio + 1)
     train_dataloader = load_data(cfg, mode='train', local_rank=local_rank)
     model = load_model(cfg).to(local_rank)
@@ -146,13 +121,21 @@ def main_worker(local_rank, cfg):
     scheduler = LambdaLR(optimizer, lr_lambda)
     
     # ------------------------------------------Load Checkpoint & optimizer
-    if cfg.load_checkpoint:
+    if cfg.load_checkpoint or cfg.checkpoint_path:
         file_path = Path(f"{cfg.path.ckp_dir}/{cfg.model.model_name}_{cfg.dataset.dataset_name}_{cfg.load_mark}.pth")
-        checkpoint = torch.load(file_path, map_location='cpu')
+        checkpoint = torch.load(cfg.checkpoint_path or file_path, map_location='cpu', weights_only=False)
+        check_checkpoint(checkpoint, cfg)
         model.load_state_dict(checkpoint['model_state_dict'])  # After Distributed
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if not cfg.eval_only:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+    if cfg.eval_only:
+        if not cfg.checkpoint_path and not cfg.load_checkpoint:
+            raise ValueError('Evaluation requires a selected checkpoint')
+        pretty_print(evaluate(model, local_rank, cfg, cfg.eval_split))
+        dist.destroy_process_group()
+        return
     optimizer.zero_grad(set_to_none=True)
     scaler = amp.GradScaler()
 
@@ -170,12 +153,22 @@ def main_worker(local_rank, cfg):
 
     if local_rank == 0:
         wandb.finish()
+    dist.destroy_process_group()
 
 
 @hydra.main(version_base="1.2", config_path=os.path.join(get_root(), "configs"), config_name="small")
 def main(cfg: DictConfig):
     seed_everything(cfg.seed)
-    cfg.gpu_num = torch.cuda.device_count()
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError('Use exactly one visible CUDA GPU (CUDA_VISIBLE_DEVICES=0); CPU graph audit needs no GPU')
+    cfg.gpu_num = 1
+    if cfg.num_epochs < 1 or cfg.batch_size < 1 or cfg.accumulation_steps < 1:
+        raise ValueError('epochs, batch size and accumulation steps must be positive')
+    if cfg.max_steps is not None and cfg.max_steps < 1:
+        raise ValueError('max_steps must be positive')
+    output = Path(cfg.result_dir or cfg.path.pred_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, output / 'config.yaml', resolve=True)
     prepare_preprocessed_data(cfg)
     mp.spawn(main_worker, nprocs=cfg.gpu_num, args=(cfg,))
 
