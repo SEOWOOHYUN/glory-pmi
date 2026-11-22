@@ -19,3 +19,7 @@ multirun/
 outputs/
 pred/
 mlruns/
+.env
+.venv/
+.superpowers/
+environment-lock.txt
