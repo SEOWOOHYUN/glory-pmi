@@ -21,24 +21,42 @@ MIND-small과 Adressa-1week에 공통 실행기를 사용합니다. 원논문 �
 ```bash
 git clone https://github.com/SEOWOOHYUN/glory-pmi.git
 cd glory-pmi
-git switch experiment/count
+git switch feat/pmi-neighbor-experiments
 ```
 
-저장소는 private입니다. 팀원은 저장소 접근 권한이 있어야 합니다.
+공통 브랜치 하나에서 `--method`로 세 방법을 모두 실행할 수 있습니다. **`main`만 받으면 실험 실행기가 없습니다.** 포크할 때 공통 실험 브랜치도 포함하세요. 기본 브랜치만 포크했다면 아래처럼 원본의 공통 브랜치를 가져올 수 있습니다.
+
+```bash
+# 자신의 포크를 clone한 폴더에서 실행 (upstream이 이미 있으면 remote add 생략)
+git remote add upstream https://github.com/SEOWOOHYUN/glory-pmi.git
+git fetch upstream feat/pmi-neighbor-experiments
+git switch -c feat/pmi-neighbor-experiments upstream/feat/pmi-neighbor-experiments
+git push -u origin feat/pmi-neighbor-experiments
+```
+
+기존 `experiment/*` 브랜치는 공통 수정이 자동 반영되지 않습니다. 이 보완 PR이 공통 브랜치에 병합된 뒤에는 그 브랜치를 사용하거나, 팀에서 공통 수정 커밋을 실험 브랜치에 반영하세요. 저장소에 명시적 LICENSE가 없으므로 포크 외 재배포·재사용 조건은 기반 GLORY 코드와 함께 확인해야 합니다.
 
 ## 실행 환경
 
-학습에는 **CUDA GPU 1개**가 필요합니다. Colab GPU 런타임 또는 Linux CUDA 환경에서 실행하세요. Mac/CPU에서는 전처리·그래프 분석·테스트를 실행할 수 있습니다. CUDA 전체 학습은 아직 이 작업 환경에서 검증하지 못했습니다.
+학습 기준 환경은 **Linux, Python 3.11, CUDA GPU 1개**입니다. Mac/CPU에서는 그래프 분석·테스트를 실행할 수 있습니다. CUDA 전체 학습은 아직 이 작업 환경에서 검증하지 못했습니다. 데이터와 GloVe는 저장소에 포함되지 않으며 아래 단계에서 별도로 준비합니다.
 
 ```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+# NVIDIA 드라이버가 설치된 Linux CUDA 환경
+nvidia-smi
+python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 python -m pip install -r requirements.txt
-# 설치된 환경을 실험 기록에 보관
+python -m pip check
+# 실제로 설치된 간접 의존성까지 기록해 모든 비교 실험에서 공유
 python -m pip freeze > environment-lock.txt
+export CUDA_VISIBLE_DEVICES=0
 ```
 
-CPU 테스트 확인 환경: Python 3.9, PyTorch 2.8.0, PyG 2.6.1, NumPy 1.26.4, scikit-learn 1.6.1. CUDA용 PyTorch는 런타임에 맞게 설치하고, 모든 실험에서 같은 환경을 쓰세요. 원본의 `requirements.txt`는 버전 고정 파일이 아닙니다.
+CUDA wheel 명령은 [PyTorch 2.8 공식 설치 안내](https://pytorch.org/get-started/previous-versions/#v280)에 따릅니다. 드라이버·GPU와 호환되는 wheel을 선택하세요. `requirements.txt`는 직접 의존성을 고정하지만 플랫폼별 전체 lock 파일은 아닙니다. CPU 테스트는 Python 3.9에서도 확인하며 CI는 Python 3.11을 사용합니다. Linux CPU 테스트는 위 CUDA 설치 줄 대신 `python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu`를 사용합니다. Apple Silicon은 `python -m pip install torch==2.8.0`을 사용하고, 학습은 CUDA 머신에서 실행하세요.
 
-Colab에서는 아래 셸 명령 앞에 `!`를 붙이고 저장소로 `%cd` 하세요. 런타임 종료에 대비해 `--output`으로 마운트한 Drive 경로를 지정할 수 있습니다. 데이터 캐시는 동시에 쓰지 말고 실험을 순서대로 실행하세요.
+Colab에서는 GPU 런타임을 선택하고 Python 버전을 먼저 확인하세요. 설치 후 런타임을 재시작하고 저장소로 `%cd` 한 뒤 `%env CUDA_VISIBLE_DEVICES=0`을 적용합니다. 아래 셸 명령 앞에는 `!`를 붙입니다. 런타임 종료에 대비해 `--output`으로 마운트한 Drive 경로를 지정할 수 있습니다. 데이터 캐시는 동시에 쓰지 말고 실험을 순서대로 실행하세요.
 
 ## 데이터 준비
 
@@ -78,6 +96,27 @@ python scripts/prepare_data.py adressa-1week \
 
 전처리는 기존 출력 폴더를 덮어쓰지 않습니다. `preparation.json`에 원본 해시·분할·후보 생성 조건이 저장됩니다. `train/val/test` 각각 `news.tsv`, `behaviors.tsv`, `entity_embedding.vec`를 갖는 공통 형식입니다.
 
+## 실행 전 점검과 첫 학습
+
+데이터 준비 후 저장소 루트에서 실행하세요. 파일 누락·빈 파일, 의존성 import, CUDA/NCCL, GPU 연산을 점검합니다. 파일 전체의 내용이나 전체 학습의 메모리 요구량까지 검증하는 명령은 아닙니다.
+
+```bash
+python scripts/check_environment.py --dataset mind-small
+# 또는
+python scripts/check_environment.py --dataset adressa-1week
+```
+
+Mac/CPU에서는 `--cpu-only`로 GPU 점검을 제외할 수 있습니다. 이 결과는 CUDA 학습 성공을 뜻하지 않습니다. 별도 데이터 경로를 쓰면 점검과 실행 모두 같은 `--data-dir`을 지정하세요. 최초 토큰 전처리에는 NLTK `punkt`/`punkt_tab` 다운로드를 위한 인터넷 연결이 필요합니다.
+
+먼저 2개 미니배치만 학습해 체크포인트·평가까지 이어지는지 확인할 수 있습니다.
+
+```bash
+python scripts/run_experiment.py --dataset mind-small --method count \
+  --seed 3407 --prepare --max-steps 2 --output runs/mind-small-trial
+```
+
+이 명령은 **전체 전처리와 마지막 전체 validation을 포함**하므로 즉시 끝나는 테스트가 아닙니다. 시험 결과를 성능 비교에 사용하지 마세요. 성공하면 아래 정식 학습 명령을 사용합니다. 같은 데이터의 전처리를 이미 마쳤다면 정식 Count 실행에서 `--prepare`를 생략해도 됩니다. GPU 메모리가 부족하면 우선 오류를 확인하고, 배치 조건을 바꾸는 경우 모든 방법에 동일하게 적용해야 합니다.
+
 ## 먼저 확인할 것: 이웃이 실제로 바뀌는가?
 
 GPU 없이 모든 방법과 λ를 한 번에 비교합니다.
@@ -107,7 +146,7 @@ python scripts/run_experiment.py --dataset adressa-1week --method ppmi --seed 34
 python scripts/run_experiment.py --dataset adressa-1week --method shrunk_ppmi --lambda 5 --seed 3407
 ```
 
-첫 실행이나 원본 데이터 변경 후에는 `--prepare`를 사용합니다. 기존 전처리의 데이터 해시가 확인되지 않거나 달라지면 재생성을 요구합니다. 실패한 실행 폴더를 덮어쓰지 않으므로 재시도는 `--output runs/새이름`을 지정하세요. `--dry-run`은 준비된 TSV에서 실행 명령만 확인합니다. 캐시와 체크포인트는 본인이 생성한 신뢰할 수 있는 파일만 사용하세요.
+첫 실행이나 원본 데이터 변경 후에는 `--prepare`를 사용합니다. 기존 전처리의 데이터 해시가 확인되지 않거나 달라지면 재생성을 요구합니다. seed별 behavior 캐시도 원본 behavior 해시·seed·음성 샘플 수·GPU 분할 수를 확인하므로, 다른 seed로 돌아가도 오래된 샘플을 재사용하지 않습니다. 메타데이터 없는 예전 behavior 캐시는 한 번 다시 생성합니다. 실패한 실행 폴더를 덮어쓰지 않으므로 재시도는 `--output runs/새이름`을 지정하세요. `--dry-run`은 준비된 TSV에서 실행 명령만 확인합니다. `--max-steps`를 사용하면 기본 결과 폴더에 `-trial<횟수>`가 붙어 정식 실행과 구분됩니다. 캐시와 체크포인트는 본인이 생성한 신뢰할 수 있는 파일만 사용하세요.
 
 | 공통 조건 | 값 |
 |---|---|

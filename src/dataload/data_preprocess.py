@@ -1,4 +1,5 @@
 import collections
+import hashlib
 import os
 from pathlib import Path
 from nltk.tokenize import word_tokenize
@@ -42,14 +43,27 @@ def get_sample(all_elements, num_sample):
 
 def prepare_distributed_data(cfg, mode="train"):
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
-    # check
-    target_file = os.path.join(data_dir[mode], f"behaviors_np{cfg.npratio}_seed{cfg.seed}_0.tsv")
-    if os.path.exists(target_file) and not cfg.reprocess:
+    behavior_file_path = Path(data_dir[mode]) / 'behaviors.tsv'
+    targets = [Path(data_dir[mode]) / f'behaviors_np{cfg.npratio}_seed{cfg.seed}_{rank}.tsv'
+               for rank in range(cfg.gpu_num)]
+    stamp = Path(str(targets[0]) + '.json')
+    digest = hashlib.sha256()
+    with behavior_file_path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    signature = {'version': 1, 'behaviors_sha256': digest.hexdigest(), 'mode': mode,
+                 'seed': cfg.seed, 'npratio': cfg.npratio, 'gpu_num': cfg.gpu_num}
+    try:
+        cached_signature = json.loads(stamp.read_text())
+    except (OSError, ValueError):
+        cached_signature = None
+    if not cfg.reprocess and cached_signature == signature and all(p.is_file() for p in targets):
         return 0
-    print(f'Target_file is not exist. New behavior file in {target_file}')
+    # Invalidate before writing any shard; an interrupted rebuild must be retried.
+    stamp.unlink(missing_ok=True)
+    print(f'[{mode}] Rebuilding behavior cache: {targets[0]}')
 
     behaviors = []
-    behavior_file_path = os.path.join(data_dir[mode], 'behaviors.tsv')
 
     if mode == 'train':
         with open(behavior_file_path, 'r', encoding='utf-8') as f:
@@ -83,10 +97,14 @@ def prepare_distributed_data(cfg, mode="train"):
                 behaviors_per_file[i % cfg.gpu_num].append(line)
 
     print(f'[{mode}]Writing files...')
-    for i in range(cfg.gpu_num):
-        processed_file_path = os.path.join(data_dir[mode], f'behaviors_np{cfg.npratio}_seed{cfg.seed}_{i}.tsv')
-        with open(processed_file_path, 'w') as f:
+    for i, target in enumerate(targets):
+        temporary = Path(str(target) + '.tmp')
+        with temporary.open('w', encoding='utf-8') as f:
             f.writelines(behaviors_per_file[i])
+        temporary.replace(target)
+    temporary_stamp = Path(str(stamp) + '.tmp')
+    temporary_stamp.write_text(json.dumps(signature, sort_keys=True) + '\n')
+    temporary_stamp.replace(stamp)
 
     return len(behaviors)
 
