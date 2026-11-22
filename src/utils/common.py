@@ -12,7 +12,7 @@ from pathlib import Path
 import torch.distributed as dist
 
 import importlib
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 
 def seed_everything(seed):
@@ -50,6 +50,7 @@ def save_model(cfg, model, optimizer=None, mark=None):
     torch.save(
         {
             'model_state_dict': model.module.state_dict(),
+            'experiment': checkpoint_signature(cfg),
             'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
         },
         file_path)
@@ -109,7 +110,7 @@ class EarlyStopping:
     def __init__(self, patience=3):
         self.patience = patience
         self.counter = 0
-        self.best_score = 0.0
+        self.best_score = float('-inf')
 
     def __call__(self, score):
         """
@@ -129,3 +130,16 @@ class EarlyStopping:
                 early_stop = False
 
         return early_stop, get_better
+
+
+def checkpoint_signature(cfg):
+    return {"dataset": cfg.dataset.dataset_name, "seed": cfg.seed,
+            "data_fingerprint": cfg.data_fingerprint,
+            "neighbor_method": cfg.neighbor_method,
+            "pmi_lambda": cfg.pmi_lambda if cfg.neighbor_method == 'shrunk_ppmi' else None,
+            "model": OmegaConf.to_container(cfg.model, resolve=True)}
+
+
+def check_checkpoint(checkpoint, cfg):
+    if checkpoint.get('experiment') != checkpoint_signature(cfg):
+        raise ValueError('Checkpoint dataset/seed/method/model does not match this run; use a matching project checkpoint')
