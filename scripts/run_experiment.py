@@ -29,6 +29,8 @@ def parser():
     p.add_argument('--seed', type=int, default=3407)
     p.add_argument('--data-dir', type=Path)
     p.add_argument('--output', type=Path)
+    p.add_argument('--resume', action='store_true')
+    p.add_argument('--save-every', type=positive_int, default=1000)
     p.add_argument('--prepare', action='store_true', help='rebuild preprocessing (first run required)')
     p.add_argument('--checkpoint', type=Path, help='evaluate this checkpoint instead of training')
     p.add_argument('--split', choices=['val', 'test'], default='val')
@@ -103,9 +105,12 @@ def main():
     if args.dry_run:
         print(json.dumps(command, indent=2))
         return
-    if output.exists():
+    if args.resume and (not (output / "last.pt").is_file() or args.prepare or args.checkpoint):
+        raise ValueError("Resume requires last.pt, without --prepare or --checkpoint")
+    command.extend([f'+save_every={args.save_every}', f'+resume={str(args.resume).lower()}'])
+    if output.exists() and not args.resume:
         raise FileExistsError(f'Refusing to overwrite a run: {output}; choose --output')
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=args.resume)
     _, popularity, info = read_training(data / 'train/behaviors.tsv')
     (output / 'popularity.json').write_text(json.dumps({'popularity': popularity, 'head': sorted(head_items(popularity))}))
     files = {}
@@ -125,7 +130,7 @@ def main():
                 'git_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip()),
                 'scope': 'validation' if args.split == 'val' else 'held-out test',
                 'accumulation': 'upstream sum of two minibatch mean losses, no division by 2'}
-    (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    (output / ('resume-manifest.json' if args.resume else 'manifest.json')).write_text(json.dumps(manifest, indent=2) + '\n')
     environment = dict(os.environ, PROJECT_ROOT=str(ROOT), WANDB_MODE='disabled')
     subprocess.run(command, cwd=ROOT, env=environment, check=True)
     (data / 'experiment-cache.json').write_text(json.dumps(files, indent=2) + '\n')

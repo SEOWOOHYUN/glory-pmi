@@ -1,5 +1,6 @@
 import os.path
 import math
+import json
 import shutil
 from itertools import islice
 from pathlib import Path
@@ -20,6 +21,7 @@ from dataload.data_preprocess import prepare_preprocessed_data
 from utils.metrics import *
 from utils.common import *
 from utils.evaluation import evaluate
+from utils.resume import save_resume, restore_resume
 
 ### custom your wandb setting here ###
 # os.environ["WANDB_API_KEY"] = ""
@@ -33,10 +35,49 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
     sum_auc = torch.zeros(1).to(local_rank)
 
     max_steps = cfg.max_steps or math.ceil(cfg.num_epochs * math.ceil(cfg.dataset.pos_count / cfg.batch_size))
+    interval = getattr(cfg, 'save_every', 0)
+    if interval < 0 or interval % cfg.accumulation_steps:
+        raise ValueError('save_every must be a positive multiple of accumulation_steps')
+    resume_path = Path(cfg.result_dir or cfg.path.pred_dir) / 'last.pt' if interval else None
+    signature = dict(checkpoint_signature(cfg), batch_size=cfg.batch_size,
+                     accumulation_steps=cfg.accumulation_steps, max_steps=max_steps,
+                     optimizer=OmegaConf.to_container(cfg.optimizer, resolve=True),
+                     warmup_ratio=cfg.warmup_ratio, val_steps=cfg.val_steps,
+                     val_skip_epochs=cfg.val_skip_epochs, early_stop_patience=cfg.early_stop_patience,
+                     npratio=cfg.npratio, dropout=cfg.dropout_probability) if interval else None
+    start = 0
+    iterator = iter(dataloader)
+    if getattr(cfg, 'resume', False):
+        if not resume_path.exists():
+            raise FileNotFoundError(resume_path)
+        # Rebuild deterministic iterator position before restoring RNG state.
+        saved = torch.load(resume_path, map_location='cpu', weights_only=False)
+        if saved.get('signature') != signature:
+            raise ValueError('Resume configuration/data mismatch')
+        start = saved['progress']['step']
+        if saved['progress']['finished']:
+            print('Run already finished.', flush=True)
+            return
+        for _ in range(start % math.ceil(cfg.dataset.pos_count / cfg.batch_size)):
+            next(iterator)
+        state = restore_resume(resume_path, model, optimizer, scheduler, scaler, signature)
+        sum_loss.fill_(state['sum_loss'])
+        sum_auc.fill_(state['sum_auc'])
+        early_stopping.__dict__.update(state['early_stopping'])
+        print(f'Resumed minibatch {start}/{max_steps}', flush=True)
+
+    def persist(step, finished=False):
+        if not interval:
+            return
+        save_resume(resume_path, model, optimizer, scheduler, scaler,
+                    dict(step=step, finished=finished, sum_loss=sum_loss.item(),
+                         sum_auc=sum_auc.item(), early_stopping=vars(early_stopping).copy()), signature)
+        print(f'Saved resume checkpoint: {step}/{max_steps}, finished={finished}', flush=True)
+
     for cnt, (subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask, labels) \
-            in enumerate(tqdm(islice(dataloader, max_steps),
-                              total=max_steps,
-                              desc=f"[{local_rank}] Training"), start=1):
+            in enumerate(tqdm(islice(iterator, max_steps - start),
+                              total=max_steps, initial=start,
+                              desc=f"[{local_rank}] Training"), start=start + 1):
         subgraph = subgraph.to(local_rank, non_blocking=True)
         mapping_idx = mapping_idx.to(local_rank, non_blocking=True)
         candidate_news = candidate_news.to(local_rank, non_blocking=True)
@@ -84,6 +125,7 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
             early_stop, get_better = early_stopping(res['auc'])
             if early_stop:
                 print("Early Stop.")
+                persist(cnt, finished=True)
                 break
             elif get_better:
                 print(f"Better Result!")
@@ -95,7 +137,8 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
                     (output / 'best_step.txt').write_text(str(cnt) + '\n')
                     wandb.run.summary.update({"best_auc": res["auc"],"best_mrr":res['mrr'], 
                                          "best_ndcg5":res['ndcg5'], "best_ndcg10":res['ndcg10']})
-
+        if interval and (cnt % interval == 0 or cnt == max_steps):
+            persist(cnt, finished=cnt == max_steps)
 
 
 def val(model, local_rank, cfg):
@@ -170,6 +213,10 @@ def main(cfg: DictConfig):
     output.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, output / 'config.yaml', resolve=True)
     prepare_preprocessed_data(cfg)
+    manifest_path = output / 'manifest.json'
+    if manifest_path.exists():
+        files = json.loads(manifest_path.read_text())['files_sha256']
+        (Path(cfg.dataset.dataset_dir) / 'experiment-cache.json').write_text(json.dumps(files, indent=2) + '\n')
     mp.spawn(main_worker, nprocs=cfg.gpu_num, args=(cfg,))
 
 
