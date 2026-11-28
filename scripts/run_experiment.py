@@ -105,8 +105,8 @@ def main():
     if args.dry_run:
         print(json.dumps(command, indent=2))
         return
-    if args.resume and (not (output / "last.pt").is_file() or args.prepare or args.checkpoint):
-        raise ValueError("Resume requires last.pt, without --prepare or --checkpoint")
+    if args.resume and (not (output / "last.pt").is_file() or args.checkpoint):
+        raise ValueError("Resume requires last.pt, without --checkpoint")
     command.extend([f'+save_every={args.save_every}', f'+resume={str(args.resume).lower()}'])
     if output.exists() and not args.resume:
         raise FileExistsError(f'Refusing to overwrite a run: {output}; choose --output')
