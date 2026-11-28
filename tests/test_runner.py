@@ -9,6 +9,13 @@ spec.loader.exec_module(module)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_trial_step_limit_is_forwarded_and_must_be_positive(self):
+        args = module.parser().parse_args(['--dataset', 'mind-small', '--max-steps', '2'])
+        command = module.build_command(args, Path('/tmp/data'), Path('/tmp/trial'), 100, 20, 20)
+        self.assertIn('max_steps=2', command)
+        with self.assertRaises(SystemExit):
+            module.parser().parse_args(['--dataset', 'mind-small', '--max-steps', '0'])
+
     def test_datasets_share_training_conditions(self):
         args = module.parser().parse_args(['--dataset', 'mind-small', '--method', 'count'])
         first = module.build_command(args, Path('/tmp/data'), Path('/tmp/result'), 100, 20, 20)

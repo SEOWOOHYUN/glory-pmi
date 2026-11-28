@@ -3,18 +3,83 @@ import unittest
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from torch_geometric.data import Data
 
 from dataload.dataset import ValidGraphDataset
-from dataload.data_preprocess import prepare_neighbor_list
+from dataload.data_preprocess import prepare_neighbor_list, prepare_distributed_data
 from dataload.neighbor_scoring import neighbor_cache_name
 import pickle
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_interrupted_forced_rebuild_is_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            cfg = NS(dataset=NS(train_dir=tmp, val_dir=tmp, test_dir=tmp),
+                     npratio=1, gpu_num=2, seed=42, reprocess=False)
+            (folder / 'behaviors.tsv').write_text('1\tu\tt\ta\ta-1 b-0\n2\tv\tt\tc\tc-1 d-0\n')
+            self.assertEqual(prepare_distributed_data(cfg), 2)
+            self.assertEqual(prepare_distributed_data(cfg), 0)
+            replace = Path.replace
+
+            def fail_second_shard(source, target):
+                if Path(target).name == 'behaviors_np1_seed42_1.tsv':
+                    raise OSError('simulated disk failure')
+                return replace(source, target)
+
+            cfg.reprocess = True
+            with patch.object(Path, 'replace', fail_second_shard):
+                with self.assertRaisesRegex(OSError, 'simulated disk failure'):
+                    prepare_distributed_data(cfg)
+            cfg.reprocess = False
+            self.assertEqual(prepare_distributed_data(cfg), 2)
+            self.assertEqual(prepare_distributed_data(cfg), 0)
+
+    def test_changed_data_rebuilds_an_older_seeds_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            cfg = NS(dataset=NS(train_dir=tmp, val_dir=tmp, test_dir=tmp),
+                     npratio=1, gpu_num=1, seed=42, reprocess=True)
+            raw = folder / 'behaviors.tsv'
+            raw.write_text('old\tu\tt\ta\ta-1 b-0\n')
+            prepare_distributed_data(cfg)
+            raw.write_text('new\tu\tt\tc\tc-1 d-0\n')
+            cfg.seed = 3407
+            prepare_distributed_data(cfg)
+            cfg.seed, cfg.reprocess = 42, False
+            prepare_distributed_data(cfg)
+            self.assertEqual((folder / 'behaviors_np1_seed42_0.tsv').read_text(),
+                             'new\tu\tt\tc\tc\td\n')
+
+    def test_legacy_cache_without_provenance_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            cfg = NS(dataset=NS(train_dir=tmp, val_dir=tmp, test_dir=tmp),
+                     npratio=1, gpu_num=1, seed=42, reprocess=False)
+            (folder / 'behaviors.tsv').write_text('new\tu\tt\tc\tc-1 d-0\n')
+            target = folder / 'behaviors_np1_seed42_0.tsv'
+            target.write_text('unverified old samples\n')
+            prepare_distributed_data(cfg)
+            self.assertEqual(target.read_text(), 'new\tu\tt\tc\tc\td\n')
+
+    def test_missing_shard_is_regenerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            cfg = NS(dataset=NS(train_dir=tmp, val_dir=tmp, test_dir=tmp),
+                     npratio=1, gpu_num=2, seed=42, reprocess=False)
+            (folder / 'behaviors.tsv').write_text('1\tu\tt\ta\ta-1 b-0\n2\tv\tt\tc\tc-1 d-0\n')
+            prepare_distributed_data(cfg)
+            shard = folder / 'behaviors_np1_seed42_1.tsv'
+            shard.unlink()
+            prepare_distributed_data(cfg)
+            self.assertTrue(shard.is_file())
+            rows = ''.join(p.read_text() for p in folder.glob('behaviors_np1_seed42_*.tsv'))
+            self.assertEqual(len(rows.splitlines()), 2)
+
     def test_empty_history_does_not_repeat_or_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'b.tsv'

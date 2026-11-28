@@ -12,6 +12,13 @@ sys.path.insert(0, str(ROOT / 'src'))
 from dataload.neighbor_scoring import read_training, head_items
 
 
+def positive_int(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError('must be positive')
+    return value
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset', required=True, choices=['mind-small', 'adressa-1week'])
@@ -22,10 +29,14 @@ def parser():
     p.add_argument('--seed', type=int, default=3407)
     p.add_argument('--data-dir', type=Path)
     p.add_argument('--output', type=Path)
+    p.add_argument('--resume', action='store_true')
+    p.add_argument('--save-every', type=positive_int, default=1000)
     p.add_argument('--prepare', action='store_true', help='rebuild preprocessing (first run required)')
     p.add_argument('--checkpoint', type=Path, help='evaluate this checkpoint instead of training')
     p.add_argument('--split', choices=['val', 'test'], default='val')
     p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--max-steps', type=positive_int,
+                   help='cap training minibatches for a trial; final validation still runs')
     return p
 
 
@@ -45,6 +56,7 @@ def build_command(args, data, output, positives, val_len, test_len):
             f'dataset.test_len={test_len}', 'ml_label=experiment',
             f'reprocess={str(args.prepare).lower()}', 'export_predictions=true',
             f'eval_only={str(args.checkpoint is not None).lower()}', f'eval_split={args.split}',
+            f'max_steps={args.max_steps if args.max_steps is not None else "null"}',
             f'checkpoint_path={args.checkpoint.resolve() if args.checkpoint else "null"}']
 
 
@@ -83,6 +95,8 @@ def main():
     run_name = f'{args.dataset}-{args.method}-lambda{args.shrinkage:g}-seed{args.seed}'
     if args.checkpoint:
         run_name += f'-eval-{args.split}'
+    elif args.max_steps is not None:
+        run_name += f'-trial{args.max_steps}'
     output = (args.output or ROOT / 'runs' / run_name).resolve()
     counts = [count_rows(data / split / 'behaviors.tsv', split == 'train') for split in ('train', 'val', 'test')]
     if not all(counts):
@@ -91,9 +105,12 @@ def main():
     if args.dry_run:
         print(json.dumps(command, indent=2))
         return
-    if output.exists():
+    if args.resume and (not (output / "last.pt").is_file() or args.checkpoint):
+        raise ValueError("Resume requires last.pt, without --checkpoint")
+    command.extend([f'+save_every={args.save_every}', f'+resume={str(args.resume).lower()}'])
+    if output.exists() and not args.resume:
         raise FileExistsError(f'Refusing to overwrite a run: {output}; choose --output')
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=args.resume)
     _, popularity, info = read_training(data / 'train/behaviors.tsv')
     (output / 'popularity.json').write_text(json.dumps({'popularity': popularity, 'head': sorted(head_items(popularity))}))
     files = {}
@@ -113,7 +130,7 @@ def main():
                 'git_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip()),
                 'scope': 'validation' if args.split == 'val' else 'held-out test',
                 'accumulation': 'upstream sum of two minibatch mean losses, no division by 2'}
-    (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    (output / ('resume-manifest.json' if args.resume else 'manifest.json')).write_text(json.dumps(manifest, indent=2) + '\n')
     environment = dict(os.environ, PROJECT_ROOT=str(ROOT), WANDB_MODE='disabled')
     subprocess.run(command, cwd=ROOT, env=environment, check=True)
     (data / 'experiment-cache.json').write_text(json.dumps(files, indent=2) + '\n')
